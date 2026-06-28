@@ -56,7 +56,7 @@ const Config = {
     ProgressThrottleMs: 1200,
   },
 };
-const APP_VERSION = "2026-06-28.5";
+const APP_VERSION = "2026-06-28.7";
 function toBool(v) {
   if (v === true || v === 1) return true;
   if (v === false || v === 0 || v == null) return false;
@@ -324,8 +324,7 @@ function getBaseDomain(env, request = null) {
     env?.RELAYEMBY_BASE_DOMAIN ||
       env?.RELAY_BASE_DOMAIN ||
       env?.BASE_DOMAIN ||
-      env?.CF_RECORD_NAME ||
-      env?.CUSTOM_DOMAIN ||
+      env?.CF_ZONE_NAME ||
       "",
   );
   if (configured) return configured;
@@ -333,12 +332,6 @@ function getBaseDomain(env, request = null) {
   const host = splitHostPort(request.headers.get("Host") || "").hostname;
   if (!host || host.includes("workers.dev") || host === "localhost")
     return host;
-  try {
-    const path = new URL(request.url).pathname;
-    if (path === "/" || path === "/admin" || path.startsWith("/admin/")) {
-      return host;
-    }
-  } catch {}
   const parts = host.split(".").filter(Boolean);
   if (parts.length >= 3 && Validators.NAME_RE.test(parts[0])) {
     return parts.slice(1).join(".");
@@ -5612,8 +5605,25 @@ async init(prefetchedList = null){
     await this.refresh();
   }
   mountFabToControls();
+  this.bindMenuDismiss();
   this.bindBgRangePreview();
   this.startAutoRefresh();
+},
+bindMenuDismiss(){
+  if (this._menuDismissBound) return;
+  this._menuDismissBound = true;
+  document.addEventListener('click', (e) => {
+    const panel = $('#menuPanel');
+    if (!panel || panel.style.display !== 'block') return;
+    const menu = panel.closest('.menu');
+    if (menu && menu.contains(e.target)) {
+      if (e.target && e.target.closest && e.target.closest('#menuPanel button')) {
+        this.hideMenu();
+      }
+      return;
+    }
+    this.hideMenu();
+  });
 },
 openTagSuggest(){
   const inp = $('#inTag');
@@ -5687,9 +5697,10 @@ applyBg(cfg){
     this.openModal("tgModal");
   },
   async openCnameModal() {
+    if ($("#cnameCurrent")) $("#cnameCurrent").textContent = "加载中...";
+    this.openModal("cnameModal");
     await this.loadDnsConfig();
     await this.loadCnameStatus();
-    this.openModal("cnameModal");
   },
   async loadDnsConfig() {
     const r = await API.req({ action: "dns.config.get" });
@@ -7143,6 +7154,22 @@ export default {
   async fetch(request, env, ctx) {
     cleanupTTLMaps();
     const url = new URL(request.url);
+    if (url.pathname === "/favicon.ico")
+      return new Response("", { status: 204 });
+    let segments = [];
+    try {
+      segments = url.pathname
+        .split("/")
+        .filter(Boolean)
+        .map(decodeURIComponent);
+    } catch {
+      return new Response("Bad Request: invalid URL encoding", { status: 400 });
+    }
+    const root = segments[0];
+    if (root === "admin") {
+      if (request.method === "POST") return Database.handleApi(request, env);
+      return UI.renderAdmin(request, env);
+    }
     const hostNodeName = getNodeHostMatch(request, env);
     if (hostNodeName) {
       const nodeData = await Database.getNode(hostNodeName, env, ctx, "admin");
@@ -7158,27 +7185,11 @@ export default {
         ctx,
       );
     }
-    if (url.pathname === "/favicon.ico")
-      return new Response("", { status: 204 });
     if (url.pathname === "/")
       return new Response(null, {
         status: 302,
         headers: { Location: "/admin" },
       });
-    let segments = [];
-    try {
-      segments = url.pathname
-        .split("/")
-        .filter(Boolean)
-        .map(decodeURIComponent);
-    } catch {
-      return new Response("Bad Request: invalid URL encoding", { status: 400 });
-    }
-    const root = segments[0];
-    if (root === "admin") {
-      if (request.method === "POST") return Database.handleApi(request, env);
-      return UI.renderAdmin(request, env);
-    }
     const enableDirect = String(env.ENABLE_DIRECT_PROXY || "0") === "1";
     if (!enableDirect) return new Response("Node Not Found", { status: 404 });
     let directRaw = url.pathname.slice(1);
