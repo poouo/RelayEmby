@@ -73,6 +73,8 @@ database_id = "你的 D1 database_id"
 ADMIN_TOKEN = "你的后台登录密码"
 ```
 
+仓库已包含最小 `wrangler.toml`，用于告诉 Wrangler 入口文件是 `worker.js`。为了避免提交敏感信息，D1 数据库 ID 和 `ADMIN_TOKEN` 不写入仓库；请在 Cloudflare 控制台为 Worker 绑定 D1，并在变量中设置 `ADMIN_TOKEN`。
+
 部署命令：
 
 ```bash

@@ -1,0 +1,11 @@
+name = "relayemby"
+main = "worker.js"
+compatibility_date = "2024-06-01"
+
+# Bind a D1 database named EMBY_D1 in Cloudflare before deploying.
+# The Worker code also accepts D1 or DB as fallback binding names.
+# Example:
+# [[d1_databases]]
+# binding = "EMBY_D1"
+# database_name = "relayemby"
+# database_id = "your-d1-database-id"
