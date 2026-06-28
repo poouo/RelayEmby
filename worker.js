@@ -56,7 +56,7 @@ const Config = {
     ProgressThrottleMs: 1200,
   },
 };
-const APP_VERSION = "2026-06-28.7";
+const APP_VERSION = "2026-06-28.10";
 function toBool(v) {
   if (v === true || v === 1) return true;
   if (v === false || v === 0 || v == null) return false;
@@ -1783,6 +1783,68 @@ const Database = {
     }
     return arr.length;
   },
+  async listDnsTypeRecordsByName(env, type, recordName, request = null) {
+    const zoneId = await this.getZoneId(env, request);
+    const q = await this.cfApi(
+      env,
+      "GET",
+      `/zones/${zoneId}/dns_records?type=${encodeURIComponent(type)}&name=${encodeURIComponent(recordName)}`,
+    );
+    return Array.isArray(q?.result) ? q.result : [];
+  },
+  async deleteDnsTypeRecordsByName(env, type, recordName, request = null) {
+    const zoneId = await this.getZoneId(env, request);
+    const arr = await this.listDnsTypeRecordsByName(env, type, recordName, request);
+    for (const it of arr) {
+      await this.cfApi(env, "DELETE", `/zones/${zoneId}/dns_records/${it.id}`);
+    }
+    return arr.length;
+  },
+  async upsertDnsRecordsByName(env, recordName, type, contents = [], opts = {}, request = null) {
+    const zoneId = await this.getZoneId(env, request);
+    const ttl = Math.max(1, Math.min(86400, Number(opts.ttl ?? 1)));
+    const proxied = !!opts.proxied;
+    const values = Array.from(new Set((contents || []).filter(Boolean)));
+    const existing = await this.listDnsTypeRecordsByName(env, type, recordName, request);
+    const out = [];
+    for (let i = 0; i < values.length; i++) {
+      const content = values[i];
+      const old = existing[i];
+      if (old) {
+        const upd = await this.cfApi(
+          env,
+          "PUT",
+          `/zones/${zoneId}/dns_records/${old.id}`,
+          { type, name: recordName, content, ttl, proxied },
+        );
+        out.push({
+          action: "update",
+          type,
+          name: recordName,
+          before: old.content || "",
+          content: upd?.result?.content || content,
+        });
+      } else {
+        const crt = await this.cfApi(
+          env,
+          "POST",
+          `/zones/${zoneId}/dns_records`,
+          { type, name: recordName, content, ttl, proxied },
+        );
+        out.push({
+          action: "create",
+          type,
+          name: recordName,
+          before: "",
+          content: crt?.result?.content || content,
+        });
+      }
+    }
+    for (let i = values.length; i < existing.length; i++) {
+      await this.cfApi(env, "DELETE", `/zones/${zoneId}/dns_records/${existing[i].id}`);
+    }
+    return out;
+  },
   async upsertDnsRecords(env, type, contents = [], opts = {}, request = null) {
     const recordName = await this.getDnsRecordName(env, request);
     const zoneId = await this.getZoneId(env, request);
@@ -1951,6 +2013,51 @@ const Database = {
       await kv.put("sys:dns_replace_mode", mode);
     }
     return await this.getDnsStatus(env, request);
+  },
+  buildNodeDnsName(env, request, nodeName) {
+    const node = String(nodeName || "").trim().toLowerCase();
+    if (!Validators.NAME_RE.test(node)) return "";
+    const base = normalizeHostName(getBaseDomain(env, request));
+    if (!base || base.includes("workers.dev") || base === "localhost") return "";
+    const { hostname } = splitHostPort(base);
+    return hostname ? `${node}.${hostname}` : "";
+  },
+  async getNodeDnsCnameTarget(env, request = null) {
+    const cfg = await this.getDnsConfig(env, request);
+    if (!cfg.hasToken) return "";
+    const baseStatus = await this.getDnsStatus(env, request);
+    const cur = Array.isArray(baseStatus?.cname) ? String(baseStatus.cname[0] || "").trim() : "";
+    return this.normalizeDnsHost(cur);
+  },
+  async syncNodeDnsRecord(env, request, nodeName) {
+    const cfg = await this.getDnsConfig(env, request);
+    if (!cfg.hasToken) return { skipped: true, reason: "no_token" };
+    const recordName = this.buildNodeDnsName(env, request, nodeName);
+    if (!recordName) return { skipped: true, reason: "no_record_name" };
+    const cname = await this.getNodeDnsCnameTarget(env, request);
+    if (!cname) return { skipped: true, reason: "no_cname_target", name: recordName };
+    await this.deleteDnsTypeRecordsByName(env, "A", recordName, request);
+    await this.deleteDnsTypeRecordsByName(env, "AAAA", recordName, request);
+    const out = await this.upsertDnsRecordsByName(
+      env,
+      recordName,
+      "CNAME",
+      [cname],
+      { ttl: 60, proxied: false },
+      request,
+    );
+    return { success: true, name: recordName, cname, records: out };
+  },
+  async deleteNodeDnsRecord(env, request, nodeName) {
+    const cfg = await this.getDnsConfig(env, request);
+    if (!cfg.hasToken) return { skipped: true, reason: "no_token" };
+    const recordName = this.buildNodeDnsName(env, request, nodeName);
+    if (!recordName) return { skipped: true, reason: "no_record_name" };
+    const removed =
+      (await this.deleteDnsTypeRecordsByName(env, "CNAME", recordName, request)) +
+      (await this.deleteDnsTypeRecordsByName(env, "A", recordName, request)) +
+      (await this.deleteDnsTypeRecordsByName(env, "AAAA", recordName, request));
+    return { success: true, name: recordName, removed };
   },
   async getDnsStatus(env, request = null) {
     const recordName = await this.getDnsRecordName(env, request);
@@ -2740,6 +2847,7 @@ const Database = {
           });
         }
         let saved = 0;
+        const dnsResults = [];
         const errors = [];
         for (const raw of items) {
           const v = Validators.validateNodeInput(raw);
@@ -2803,9 +2911,28 @@ const Database = {
           }
           await kv.put(newKey, this.packNode(toSave));
           await invalidate(n.name);
+          if (data.action === "save") {
+            try {
+              const dns = await this.syncNodeDnsRecord(env, request, n.name);
+              dnsResults.push({ name: n.name, ...dns });
+            } catch (e) {
+              if (oldName && oldName !== n.name) await kv.delete(newKey);
+              else if (prevRaw) await kv.put(newKey, prevRaw);
+              else await kv.delete(newKey);
+              await invalidate(n.name);
+              errors.push({
+                name: n.name,
+                error: "节点已保存但 DNS 同步失败，已回滚: " + (e?.message || e),
+              });
+              continue;
+            }
+          }
           if (data.action === "save" && oldName && oldName !== n.name) {
             await kv.delete(this.nodeKey(uid, oldName));
             await invalidate(oldName);
+            try {
+              await this.deleteNodeDnsRecord(env, request, oldName);
+            } catch (_) {}
           }
           saved++;
         }
@@ -2815,6 +2942,7 @@ const Database = {
             saved,
             failed: errors.length,
             errors,
+            dns: dnsResults,
           }),
           {
             headers: { "Content-Type": "application/json;charset=utf-8" },
@@ -2832,6 +2960,9 @@ const Database = {
         const name = vn.value;
         await kv.delete(this.nodeKey(uid, name));
         await invalidate(name);
+        try {
+          await this.deleteNodeDnsRecord(env, request, name);
+        } catch (_) {}
         return new Response(JSON.stringify({ success: true }), {
           headers: { "Content-Type": "application/json;charset=utf-8" },
         });
@@ -2845,6 +2976,9 @@ const Database = {
           const name = vn.value;
           await kv.delete(this.nodeKey(uid, name));
           await invalidate(name);
+          try {
+            await this.deleteNodeDnsRecord(env, request, name);
+          } catch (_) {}
           count++;
         }
         return new Response(JSON.stringify({ success: true, count }), {
@@ -2937,6 +3071,11 @@ const Database = {
             if (!proxyUrl) return "";
             return proxyUrl.replace(/\/+$/, "") + "/System/Info/Public";
           };
+          const buildTargetTestUrls = (n) => {
+            return normalizeTargets(n?.target || "")
+              .map((t) => String(t || "").replace(/\/+$/, "") + "/System/Info/Public")
+              .filter(Boolean);
+          };
           let target = [];
           if (Array.isArray(data.names) && data.names.length > 0) {
             const names = data.names
@@ -2985,7 +3124,25 @@ const Database = {
                 });
                 continue;
               }
-              const r = await this.checkOne(urlToCheck, 4500);
+              let r = await this.checkOne(urlToCheck, 4500);
+              let checked = urlToCheck;
+              let targetProbe = null;
+              if (!r.online) {
+                const targetUrls = buildTargetTestUrls(n);
+                for (const targetUrl of targetUrls) {
+                  targetProbe = await this.checkOne(targetUrl, 4500);
+                  if (targetProbe.online) break;
+                }
+              }
+              if (!r.online && targetProbe?.online) {
+                r = {
+                  ...r,
+                  error: "PROXY_OFFLINE_TARGET_ONLINE",
+                  targetOnline: true,
+                  targetStatus: targetProbe.status || 0,
+                  targetLatency: targetProbe.latency || targetProbe.rt || 0,
+                };
+              }
               results.push({
                 name: n.name || "",
                 ok: !!r.ok,
@@ -2993,7 +3150,10 @@ const Database = {
                 status: r.status || 0,
                 rt: r.rt || 0,
                 latency: r.latency || r.rt || 0,
-                checked: urlToCheck,
+                checked,
+                targetOnline: !!r.targetOnline,
+                targetStatus: r.targetStatus || 0,
+                targetLatency: r.targetLatency || 0,
                 error: r.error || "",
               });
             }
@@ -5106,7 +5266,7 @@ button:hover,.btn:hover{transform:translateY(-1px)}
 <body>
 <div id="bgLayer"></div>
 <div id="bgOverlay"></div>
-<div id="gate" class="gate">
+<div id="gate" class="gate" style="display:none">
   <div class="gate-box">
 <h3>管理员登录</h3>
 <div class="pass-wrap gate-pass">
@@ -5355,9 +5515,23 @@ const PRESETS = {
 };
 const Gate = {
   key: 'emby_admin_token',
-getToken() { return (sessionStorage.getItem(this.key) || '').trim(); },
-setToken(v) { sessionStorage.setItem(this.key, String(v || '').trim()); },
-clearToken() { sessionStorage.removeItem(this.key); },
+getToken() {
+  const local = (localStorage.getItem(this.key) || '').trim();
+  if (local) return local;
+  const session = (sessionStorage.getItem(this.key) || '').trim();
+  if (session) this.setToken(session);
+  return session;
+},
+setToken(v) {
+  const token = String(v || '').trim();
+  if (token) localStorage.setItem(this.key, token);
+  else localStorage.removeItem(this.key);
+  sessionStorage.setItem(this.key, token);
+},
+clearToken() {
+  localStorage.removeItem(this.key);
+  sessionStorage.removeItem(this.key);
+},
   initGateEye(){
     const icon = $('#gatePassIcon');
     if (icon) icon.innerHTML = SVG.eye;
@@ -5447,16 +5621,22 @@ async check() {
 async boot() {
   this.bindEvents();
     const token = this.getToken();
-    if (!token) { $('#gate').style.display='flex'; $('#app').style.display='none'; return; }
+    const gate = $('#gate');
+    const app = $('#app');
+    if (!token) {
+      if (gate) gate.style.display='flex';
+      if (app) app.style.display='none';
+      return;
+    }
     const d = await API.listCached({ ttl: 0, force: true });
     if (d && !d.error) {
-      $('#gate').style.display='none';
-      $('#app').style.display='block';
+      if (gate) gate.style.display='none';
+      if (app) app.style.display='block';
       App.init(d);
     } else {
       this.clearToken();
-      $('#gate').style.display='flex';
-      $('#app').style.display='none';
+      if (gate) gate.style.display='flex';
+      if (app) app.style.display='none';
     }
   },
   logout() { this.clearToken(); location.reload(); }
@@ -6021,6 +6201,7 @@ isMobileOS(){
     const s = this.statusMap[name];
     if(!s) return {cls:'unknown',txt:'未检测'};
     if(s.online) return {cls:'online',txt:'在线 '+s.latency+'ms'};
+    if(s.targetOnline) return {cls:'offline',txt:'代理离线 / 源站在线'};
     return {cls:'offline',txt:'离线'};
   },
   escapeHtml(s){
@@ -6757,9 +6938,13 @@ remindBeforeDays: Number.isFinite(Number(n.remindBeforeDays))
   async checkNode(name){
     const r = await API.req({ action:'checkStatus', names:[name] });
     if(r.success && r.results && r.results[0]){
-      this.statusMap[name] = r.results[0];
+      const one = r.results[0];
+      this.statusMap[name] = one;
       this.renderList();
-      this.toast(name + ': ' + (r.results[0].online ? ('在线 '+r.results[0].latency+'ms') : '离线'), r.results[0].online?'success':'warn');
+      const msg = one.online
+        ? ('在线 ' + one.latency + 'ms')
+        : (one.targetOnline ? '代理离线，源站在线；请检查 DNS 记录或 Worker 域名绑定' : '离线');
+      this.toast(name + ': ' + msg, one.online ? 'success' : 'warn');
     }else{
       this.toast(r.error || '检测失败','error');
     }
@@ -6996,7 +7181,17 @@ async save(){
   }
   API.clearListCache();
   this.closeAllModals();
-  this.toast('保存成功','success');
+  const dnsInfo = Array.isArray(r.dns) ? r.dns.find(x => x && x.name === name) || r.dns[0] : null;
+  if (dnsInfo && dnsInfo.skipped) {
+    const reasonMap = {
+      no_token: '未配置 Cloudflare API Token',
+      no_record_name: '无法推断节点域名',
+      no_cname_target: '没有可复用的基础 CNAME 目标'
+    };
+    this.toast('保存成功，DNS 未自动同步：' + (reasonMap[dnsInfo.reason] || dnsInfo.reason || '未知原因'), 'warn');
+  } else {
+    this.toast('保存成功','success');
+  }
   await this.refresh();
 },
 async testKeepaliveNotify(){
