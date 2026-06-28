@@ -56,6 +56,7 @@ const Config = {
     ProgressThrottleMs: 1200,
   },
 };
+const APP_VERSION = "2026-06-28.5";
 function toBool(v) {
   if (v === true || v === 1) return true;
   if (v === false || v === 0 || v == null) return false;
@@ -4680,13 +4681,14 @@ const ProxyHandler = {
 const UI = {
   renderAdmin(request = null, env = {}) {
     const baseDomain = getBaseDomain(env, request);
-    const html = `<!doctype html>
+    const html = String.raw`<!doctype html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
 <meta name="description" content="RelayEmby 是基于 Cloudflare Workers 与 D1 的 Emby 反向代理管理工具，支持节点管理、播放转发、网盘直连和状态检测。" />
 <title>RelayEmby</title>
+<!-- RelayEmby version: ${APP_VERSION} -->
 <link rel="icon" type="image/svg+xml" href='data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="%233b82f6"/><stop offset="100%" stop-color="%2360a5fa"/></linearGradient></defs><rect x="4" y="4" width="56" height="56" rx="14" fill="%231e293b"/><rect x="9" y="9" width="46" height="46" rx="10" fill="url(%23g)"/><path d="M22 20h22v6H28v6h14v6H28v6h16v6H22V20z" fill="white"/><path d="M46 44l8 4-8 4z" fill="%23bfdbfe"/></svg>'>
 <style>
 @import url("https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;600;700;800&display=swap");
@@ -5321,6 +5323,7 @@ button:hover,.btn:hover{transform:translateY(-1px)}
 </div>
 <script>
 window.RELAYEMBY_BASE_DOMAIN = ${JSON.stringify(baseDomain)};
+window.RELAYEMBY_VERSION = ${JSON.stringify(APP_VERSION)};
 const $ = (s)=>document.querySelector(s);
 function mountFabToControls(){
   const controls = document.querySelector('.controls');
@@ -7123,6 +7126,7 @@ if (document.readyState === "loading") {
         "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
         Pragma: "no-cache",
         Expires: "0",
+        "X-RelayEmby-Version": APP_VERSION,
         "Content-Security-Policy":
           "default-src 'self'; " +
           "img-src 'self' data: https:; " +
