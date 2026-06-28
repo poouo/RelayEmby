@@ -56,7 +56,7 @@ const Config = {
     ProgressThrottleMs: 1200,
   },
 };
-const APP_VERSION = "2026-06-28.10";
+const APP_VERSION = "2026-06-28.11";
 function toBool(v) {
   if (v === true || v === 1) return true;
   if (v === false || v === 0 || v == null) return false;
@@ -2294,7 +2294,7 @@ const Database = {
     GLOBALS.NodeCache.set(key, "", 5 * 60 * 1000);
     return "";
   },
-  async handleApi(request, env) {
+  async handleApi(request, env, ctx = null) {
     const auth = Auth.check(request, env);
     if (!auth.ok) return auth.response;
     const uid = "admin";
@@ -2912,27 +2912,21 @@ const Database = {
           await kv.put(newKey, this.packNode(toSave));
           await invalidate(n.name);
           if (data.action === "save") {
-            try {
-              const dns = await this.syncNodeDnsRecord(env, request, n.name);
-              dnsResults.push({ name: n.name, ...dns });
-            } catch (e) {
-              if (oldName && oldName !== n.name) await kv.delete(newKey);
-              else if (prevRaw) await kv.put(newKey, prevRaw);
-              else await kv.delete(newKey);
-              await invalidate(n.name);
-              errors.push({
-                name: n.name,
-                error: "节点已保存但 DNS 同步失败，已回滚: " + (e?.message || e),
-              });
-              continue;
-            }
+            const syncTask = this.syncNodeDnsRecord(env, request, n.name).catch((e) => {
+              console.error("syncNodeDnsRecord failed:", n.name, e?.message || e);
+            });
+            if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(syncTask);
+            else await syncTask;
+            dnsResults.push({ name: n.name, pending: !!(ctx && typeof ctx.waitUntil === "function") });
           }
           if (data.action === "save" && oldName && oldName !== n.name) {
             await kv.delete(this.nodeKey(uid, oldName));
             await invalidate(oldName);
-            try {
-              await this.deleteNodeDnsRecord(env, request, oldName);
-            } catch (_) {}
+            const deleteTask = this.deleteNodeDnsRecord(env, request, oldName).catch((e) => {
+              console.error("deleteNodeDnsRecord failed:", oldName, e?.message || e);
+            });
+            if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(deleteTask);
+            else await deleteTask;
           }
           saved++;
         }
@@ -2960,9 +2954,11 @@ const Database = {
         const name = vn.value;
         await kv.delete(this.nodeKey(uid, name));
         await invalidate(name);
-        try {
-          await this.deleteNodeDnsRecord(env, request, name);
-        } catch (_) {}
+        const deleteTask = this.deleteNodeDnsRecord(env, request, name).catch((e) => {
+          console.error("deleteNodeDnsRecord failed:", name, e?.message || e);
+        });
+        if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(deleteTask);
+        else await deleteTask;
         return new Response(JSON.stringify({ success: true }), {
           headers: { "Content-Type": "application/json;charset=utf-8" },
         });
@@ -2976,9 +2972,11 @@ const Database = {
           const name = vn.value;
           await kv.delete(this.nodeKey(uid, name));
           await invalidate(name);
-          try {
-            await this.deleteNodeDnsRecord(env, request, name);
-          } catch (_) {}
+          const deleteTask = this.deleteNodeDnsRecord(env, request, name).catch((e) => {
+            console.error("deleteNodeDnsRecord failed:", name, e?.message || e);
+          });
+          if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(deleteTask);
+          else await deleteTask;
           count++;
         }
         return new Response(JSON.stringify({ success: true, count }), {
@@ -3072,7 +3070,7 @@ const Database = {
             return proxyUrl.replace(/\/+$/, "") + "/System/Info/Public";
           };
           const buildTargetTestUrls = (n) => {
-            return normalizeTargets(n?.target || "")
+            return Validators.splitTargets(n?.target || "")
               .map((t) => String(t || "").replace(/\/+$/, "") + "/System/Info/Public")
               .filter(Boolean);
           };
@@ -7189,6 +7187,8 @@ async save(){
       no_cname_target: '没有可复用的基础 CNAME 目标'
     };
     this.toast('保存成功，DNS 未自动同步：' + (reasonMap[dnsInfo.reason] || dnsInfo.reason || '未知原因'), 'warn');
+  } else if (dnsInfo && dnsInfo.pending) {
+    this.toast('保存成功，DNS 后台同步中', 'success');
   } else {
     this.toast('保存成功','success');
   }
@@ -7362,7 +7362,7 @@ export default {
     }
     const root = segments[0];
     if (root === "admin") {
-      if (request.method === "POST") return Database.handleApi(request, env);
+      if (request.method === "POST") return Database.handleApi(request, env, ctx);
       return UI.renderAdmin(request, env);
     }
     const hostNodeName = getNodeHostMatch(request, env);
