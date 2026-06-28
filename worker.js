@@ -5120,7 +5120,7 @@ button:hover,.btn:hover{transform:translateY(-1px)}
     <span id="gatePassIcon"></span>
   </button>
 </div>
-<button id="gateBtn">进入面板</button>
+<button id="gateBtn" type="button" onclick="Gate.check()">进入面板</button>
     <div id="gateTip" class="tip">请先在 Worker 环境变量设置 ADMIN_TOKEN</div>
   </div>
 </div>
@@ -5393,14 +5393,24 @@ bindEvents() {
 },
 async check() {
   const tip = $('#gateTip');
+  const btn = $('#gateBtn');
   if (tip) {
     tip.classList.remove('ok');
     tip.classList.add('show');
     tip.innerText = '登录中...';
   }
+  if (btn) {
+    btn.disabled = true;
+    btn.dataset.oldText = btn.textContent || '进入面板';
+    btn.textContent = '登录中...';
+  }
   const v = ($('#gatePwd')?.value || '').trim();
   if (!v) {
     if (tip) tip.innerText = '请输入 ADMIN_TOKEN';
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = btn.dataset.oldText || '进入面板';
+    }
     return;
   }
   try {
@@ -5419,6 +5429,10 @@ async check() {
       tip.innerText = '登录成功';
       tip.classList.remove('show');
     }
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = btn.dataset.oldText || '进入面板';
+    }
   } catch (e) {
     this.clearToken();
     const msg = String(e?.message || e || '登录失败');
@@ -5426,6 +5440,10 @@ async check() {
       tip.classList.remove('ok');
       tip.classList.add('show');
       tip.innerText = msg === 'UNAUTHORIZED' ? '令牌错误' : ('登录失败: ' + msg);
+    }
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = btn.dataset.oldText || '进入面板';
     }
     console.error('Gate.check failed:', e);
   }
